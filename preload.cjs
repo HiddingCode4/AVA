@@ -1,0 +1,1 @@
+const {contextBridge,ipcRenderer}=require('electron');contextBridge.exposeInMainWorld('ava',Object.fromEntries(['profiles','create','login','logout','key','memory','delete','bio','connect'].map(n=>[n,(...args)=>ipcRenderer.invoke(n,...args)])));

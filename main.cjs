@@ -1,0 +1,24 @@
+const {app,BrowserWindow,ipcMain,safeStorage,session}=require('electron');
+const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),{spawn}=require('node:child_process');
+const {hash,validPin,instructions}=require('./core.cjs');
+let win,db,file,active=null,key='',busy=false;
+function save(){fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,JSON.stringify(db,null,2))}
+function profile(){if(!active)throw Error('Profil verrouillé');return db.profiles.find(p=>p.id===active)}
+function bio(action,payload){const p=profile();return new Promise((resolve,reject)=>{const executable=process.env.AVA_PYTHON||'python'; const c=spawn(executable,[path.join(__dirname,'biometrics','verify.py')],{windowsHide:true});let out='',err='';const timeout=setTimeout(()=>{c.kill();reject(Error('Vérification trop longue'))},45000);c.stdout.on('data',b=>out+=b);c.stderr.on('data',b=>err+=b);c.on('error',e=>{clearTimeout(timeout);reject(Error('Python indisponible : installer les dépendances biométriques'))});c.on('close',code=>{clearTimeout(timeout);if(code)reject(Error('Biométrie indisponible : '+err.slice(-500)));else{try{resolve(JSON.parse(out))}catch{reject(Error('Réponse biométrique invalide'))}}});c.stdin.end(JSON.stringify({action,folder:path.join(app.getPath('userData'),'biometrics',p.id),...payload}));})}
+app.whenReady().then(()=>{
+file=path.join(app.getPath('userData'),'profiles.json');db=fs.existsSync(file)?JSON.parse(fs.readFileSync(file,'utf8')):{profiles:[]};
+session.defaultSession.setPermissionRequestHandler((wc,permission,cb)=>cb(wc===win?.webContents&&permission==='media'));
+win=new BrowserWindow({width:1100,height:840,webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}});
+win.webContents.setWindowOpenHandler(()=>({action:'deny'}));win.webContents.on('will-navigate',e=>e.preventDefault());win.loadFile('ui/index.html');
+});
+app.on('window-all-closed',()=>app.quit());
+ipcMain.handle('profiles',()=>db.profiles.map(p=>({id:p.id,name:p.name})));
+ipcMain.handle('create',(_,name,pin)=>{if(!validPin(pin)||typeof name!=='string'||!name.trim()||name.length>60)throw Error('Nom et code de 6 à 12 chiffres requis');const p={id:crypto.randomUUID(),name:name.trim(),salt:crypto.randomBytes(16).toString('hex'),memory:[],owner:db.profiles.length===0};p.pin=hash(pin,p.salt);db.profiles.push(p);save();return {id:p.id,name:p.name}});
+let failures=0,nextLogin=0;
+ipcMain.handle('login',(_,id,pin)=>{if(Date.now()<nextLogin)throw Error('Attendre avant de réessayer');const p=db.profiles.find(x=>x.id===id);if(!p||!validPin(pin)||hash(pin,p.salt)!==p.pin){nextLogin=Date.now()+Math.min(60000,1000*2**failures++);throw Error('Code incorrect')}failures=0;active=id;key='';if(p.key&&safeStorage.isEncryptionAvailable())key=safeStorage.decryptString(Buffer.from(p.key,'base64'));return {name:p.name,memory:p.memory,owner:p.owner,hasKey:!!key}});
+ipcMain.handle('logout',()=>{active=null;key=''});
+ipcMain.handle('key',(_,value)=>{const p=profile();if(typeof value!=='string'||value.length>500)throw Error('Clé invalide');key=value.trim();if(safeStorage.isEncryptionAvailable())p.key=safeStorage.encryptString(key).toString('base64');else delete p.key;save();return true});
+ipcMain.handle('memory',(_,values)=>{const p=profile();if(!Array.isArray(values)||values.length>40||values.some(x=>typeof x!=='string'||x.length>600))throw Error('Mémoire trop longue');p.memory=values;save();return true});
+ipcMain.handle('delete',()=>{const p=profile();fs.rmSync(path.join(app.getPath('userData'),'biometrics',p.id),{recursive:true,force:true});db.profiles=db.profiles.filter(x=>x.id!==p.id);active=null;key='';save();return true});
+ipcMain.handle('bio',(_,action,payload)=>{if(!['enroll_face','verify_face','enroll_voice','verify_voice'].includes(action))throw Error('Action invalide');return bio(action,payload)});
+ipcMain.handle('connect',async(_,sdp,voice)=>{const p=profile();if(!key)throw Error('Ajouter une clé API OpenAI');if(busy)throw Error('Connexion déjà en cours');if(typeof sdp!=='string'||sdp.length>100000)throw Error('SDP invalide');busy=true;try{const fd=new FormData();fd.set('sdp',sdp);fd.set('session',JSON.stringify({type:'realtime',model:process.env.AVA_MODEL||'gpt-realtime-2.1',instructions:instructions(p),output_modalities:['audio'],audio:{input:{turn_detection:{type:'server_vad',threshold:0.5,silence_duration_ms:500,create_response:true,interrupt_response:true}},output:{voice:['marin','coral','shimmer','sage'].includes(voice)?voice:'marin'}}}));const r=await fetch('https://api.openai.com/v1/realtime/calls',{method:'POST',headers:{Authorization:`Bearer ${key}`,'OpenAI-Safety-Identifier':crypto.createHash('sha256').update(p.id).digest('hex')},body:fd,signal:AbortSignal.timeout(30000)});const text=await r.text();if(!r.ok)throw Error(`OpenAI ${r.status}: ${text.slice(0,600)}`);return text}finally{busy=false}});
