@@ -19,3 +19,36 @@ bind('saveMemory',async()=>{await ava.memory($('memory').value.split('\n').map(x
 bind('forget',async()=>{await ava.memory([]);$('memory').value='';stop();$('transcript').textContent='';status('Souvenirs effacés')});
 async function leave(){stop();cam?.getTracks().forEach(t=>t.stop());cam=null;$('camera').srcObject=null;await ava.logout();$('workspace').hidden=true;$('login').hidden=false;$('transcript').textContent='';$('memory').value='';await refresh()}
 bind('leave',leave);bind('remove',async()=>{if(confirm('Supprimer définitivement ce profil, sa clé, ses souvenirs et ses empreintes ?')){stop();await ava.delete();await leave()}});window.addEventListener('beforeunload',stop);refresh().catch(e=>status(e.message));
+
+let recognitionBusy = false;
+bind('testRecognition', async () => {
+  if (recognitionBusy || connecting) throw Error('Une vérification ou connexion est déjà en cours');
+  recognitionBusy = true;
+  const button = $('testRecognition');
+  button.disabled = true;
+  stop();
+  const token = epoch;
+  try {
+    status('Vérification du visage…');
+    const face = await ava.bio('verify_face', { image: image() });
+    if (token !== epoch) return;
+    if (!face.match) {
+      status(face.message || 'Visage non reconnu. Place-toi face à la caméra et réessaie.');
+      return;
+    }
+    status('Visage reconnu. Parle naturellement pendant 5 secondes…');
+    const sample = await captureVoice();
+    if (token !== epoch) return;
+    status('Comparaison de la voix…');
+    const voice = await ava.bio('verify_voice', sample);
+    if (token !== epoch) return;
+    status(voice.match
+      ? 'Visage et voix reconnus ✅ · test local expérimental'
+      : 'Visage reconnu · ' + (voice.message || 'Voix non reconnue. Réessaie dans un endroit calme.'));
+  } catch (error) {
+    if (token === epoch) status(error.message);
+  } finally {
+    recognitionBusy = false;
+    button.disabled = false;
+  }
+});
